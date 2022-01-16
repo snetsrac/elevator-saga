@@ -15,8 +15,8 @@
     };
 
     const logDebug = (message, object) => {
-        if (true) {
-            console.log(`${(new Date()).toISOString().split('T')[1]} - [DEBUG] ${message}` +
+        if (false) {
+            console.log(`${(new Date()).toISOString().split('T')[1]} - [DEBUG] ***** ${message}` +
                 `${object != undefined ? object.toString() : ''}`);
         }
     };
@@ -28,39 +28,11 @@
 
     const filterByDirection = (currentFloor, direction) => {
         return direction === 'up' ?
-            (floor) => floor > currentFloor : (floor) => floor < currentFloor;
+            (floor) => floor >= currentFloor : (floor) => floor <= currentFloor;
     }
 
     const zip = (a, b, direction) => {
-        const result = [];
-
-        if (direction === 'down') {
-            a.reverse();
-            b.reverse();
-        }
-
-        let i = 0, j = 0;
-
-        while (i < a.length && j < b.length) {
-            if (a[i] === b[i]) {
-                result.push(a[i++]);
-                j++;
-            } else if (a[i] < b[i]) {
-                result.push(a[i++]);
-            } else if (a[i] > b[i]) {
-                result.push(b[j++]);
-            }
-        }
-
-        while (i < a.length) {
-            result.push(a[i++]);
-        }
-
-        while (j < b.length) {
-            result.push(b[j++]);
-        }
-
-        return direction === 'down' ? result.reverse() : result;
+        return [...new Set(a.concat(b)).values()].sort(sortByDirection(direction));
     };
     
     // Classes
@@ -74,9 +46,14 @@
             this.#id = id;
             this.#gameObject = gameObject;
             this.#manager = manager;
+            this.#nextDirection = 'up';
             this.#gameObject.on('idle', this.#idle.bind(this));
             this.#gameObject.on('floor_button_pressed', this.#buttonPressed.bind(this));
             this.#gameObject.on('passing_floor', this.#passingFloor.bind(this));
+        }
+
+        getId() {
+            return this.#id;
         }
 
         getPassengerDestinations() {
@@ -110,9 +87,14 @@
             this.#gameObject.destinationQueue.length = 1;
             this.#gameObject.checkDestinationQueue();
 
-            this.#gameObject.goingUpIndicator(nextDirection === 'up');
-            this.#gameObject.goingDownIndicator(nextDirection === 'down');
-            this.#nextDirection = nextDirection;
+            if (nextDirection == null) {
+                this.clearIndicators();
+                this.#nextDirection = floorNum > this.getCurrentFloor() ? 'up' : 'down';
+            } else {
+                this.#gameObject.goingUpIndicator(nextDirection === 'up');
+                this.#gameObject.goingDownIndicator(nextDirection === 'down');
+                this.#nextDirection = nextDirection;
+            }
 
             logCommand(`elevator ${this.#id} sent to floor ${this.#gameObject.destinationQueue[0]}, ` +
                 `indicating ${nextDirection}`);
@@ -120,6 +102,10 @@
 
         getNextDirection() {
             return this.#nextDirection;
+        }
+
+        isFull() {
+            return this.#gameObject.loadFactor() >= 0.55;
         }
 
         #idle() {
@@ -134,6 +120,7 @@
 
         #passingFloor(floorNum, direction) {
             logEvent(`elevator ${this.#id} passing floor ${floorNum} going ${direction}`);
+            this.#manager.checkIfShouldStop(this, floorNum, direction);
         }
     }
 
@@ -144,45 +131,87 @@
         constructor(elevatorGameObjects, floorManager) {
             this.#elevators = elevatorGameObjects.map((elevatorGameObject, i) => {
                 const elevator = new Elevator(i, elevatorGameObject, this);
-                elevatorGameObject.on('stopped_at_floor', floorManager.floorVisited(i, elevator.getIndicators()));
+                elevatorGameObject.on('stopped_at_floor', floorManager.floorVisited(elevator));
                 return elevator;
             });
 
             this.#floorManager = floorManager;
         }
 
+        checkIfShouldStop(elevator, floorNum, direction) {
+            const waitingSameDir = this.#floorManager.getWaitingPassengers(floorNum, direction, direction);
+            if (waitingSameDir.length > 0 && waitingSameDir[0] === floorNum) {
+                elevator.setDestination(floorNum, direction);
+            }
+        }
+
         updateDestination(id) {
             const elevator = this.#elevators[id];
-            const currentFloor = elevator.getCurrentFloor();
             const nextDirection = elevator.getNextDirection();
             const oppDirection = nextDirection === 'up' ? 'down' : 'up';
 
-            // Search for a destination
-            const passengerDests = elevator.getPassengerDestinations();
-            const waitingSameDir = this.#floorManager.getWaitingPassengers(currentFloor, nextDirection);
-            const waitingOppDir = this.#floorManager.getWaitingPassengers(currentFloor, oppDirection);
+            let [destinationFloor, destinationDirection] = this.#searchForDestination(elevator, nextDirection);
 
-            const allSameDir = zip(passengerDests, waitingSameDir, nextDirection);
+            // If we can't find a destination, try the other direction
+            if (destinationFloor == null) {
+                logDebug('no destination found, searching other direction');
+                logDebug('');
+                [destinationFloor, destinationDirection] = this.#searchForDestination(elevator, oppDirection);
+            }
 
-            logDebug('*** destination search initiated ***');
-            logDebug('passenger destinations: ', passengerDests);
-            logDebug('same-direction waiting passengers: ', waitingSameDir);
-            logDebug(' -all same-direction floors: ', allSameDir);
-            logDebug('opposite-direction waiting passengers: ', waitingOppDir);
-
-            // If we found a destination, go to it
-            if (allSameDir.length > 0) {
-                elevator.setDestination(allSameDir[0], nextDirection);
-            } else if (waitingOppDir.length > 0) {
-                elevator.setDestination(waitingOppDir[waitingOppDir.length - 1], oppDirection);
-            } // Otherwise, wait for a button to be pressed
+            // If we found a destination, set it
+            if (destinationFloor != null) {
+                elevator.setDestination(destinationFloor, destinationDirection);
+            } // Otherwise, wait for a new button press (should only happen when there are no passengers anywhere)
             else {
                 elevator.clearIndicators();
                 this.#floorManager.onButtonPressed((floorNum, direction) => {
                     elevator.setDestination(floorNum, direction);
                 });
-                logDebug('*** no destination found, waiting for a button press ***');
+                logDebug('no destination found, waiting for a button press');
             }
+        }
+
+        #searchForDestination(elevator, nextDirection) {
+            const currentFloor = elevator.getCurrentFloor();
+            const oppDirection = nextDirection === 'up' ? 'down' : 'up';
+
+            const passengerDests = elevator.getPassengerDestinations();
+            const waitingSameDir = this.#floorManager.getWaitingPassengers(currentFloor, nextDirection, nextDirection);
+            const waitingOppDir = this.#floorManager.getWaitingPassengers(currentFloor, oppDirection, nextDirection);
+            const allSameDir = zip(passengerDests, waitingSameDir, nextDirection);
+
+            logDebug(`destination search initiated going ${nextDirection} from ${currentFloor}`);
+            logDebug('  passenger destinations: ', passengerDests);
+            logDebug('  same-direction waiting passengers: ', waitingSameDir);
+            logDebug('    -all same-direction floors: ', allSameDir);
+            logDebug('  opposite-direction waiting passengers: ', waitingOppDir);
+
+            let destinationFloor = null;
+            let destinationDirection = null;
+
+            if (allSameDir.length > 0) {
+                if (elevator.isFull()) {
+                    destinationFloor = passengerDests[0];
+                } else {
+                    destinationFloor = allSameDir[0];
+                }
+
+                if (passengerDests.length === 1 && waitingSameDir.length === 0) {
+                    if (this.#floorManager.anyWaitingPassengers()) {
+                        destinationDirection = oppDirection;
+                    }
+                } else {
+                    destinationDirection = nextDirection;
+                }
+
+
+            } else if (waitingOppDir.length > 0) {
+                destinationFloor = waitingOppDir[waitingOppDir.length - 1];
+                destinationDirection = oppDirection;
+            }
+
+            return [destinationFloor, destinationDirection];
         }
 
         getNumFloors() {
@@ -197,6 +226,10 @@
         constructor() {
             this.up = false;
             this.down = false;
+        }
+
+        toString() {
+            return `up: ${this.up}, down: ${this.down}`;
         }
     }
 
@@ -221,20 +254,40 @@
             return this.#floors.length;
         }
 
-        getWaitingPassengers(currentFloor, direction) {
+        anyWaitingPassengers() {
+            for (const floor of this.#floors) {
+                if (floor.up === true || floor.down === true) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        getWaitingPassengers(currentFloor, passengerDirection, elevatorDirection) {
+            logDebug('    checking for waiting passengers:');
+            this.#floors.forEach((floor, i) => logDebug(`      floor ${i}: `, floor));
+
             return this.#floors
-                .map((floor, id) => floor[direction] === true ? id : null)
+                .map((floor, id) => floor[passengerDirection] === true ? id : null)
                 .filter((floor) => floor != null)
-                .filter(filterByDirection(currentFloor, direction));
+                .filter(filterByDirection(currentFloor, elevatorDirection));
         }
         
-        floorVisited(i, indicators) {
+        floorVisited(elevator) {
             return (floorNum) => {
                 const floor = this.#floors[floorNum];
-                floor.up = !indicators.up;
-                floor.down = !indicators.down;
-                logEvent(`floor ${floorNum} visited by elevator ${i}, ` +
-                    `up: ${floor.up}, down: ${floor.down}`);
+
+                if (elevator.getIndicators().up) {
+                    floor.up = false;
+                }
+
+                if (elevator.getIndicators().down) {
+                    floor.down = false;
+                }
+
+                logEvent(`floor ${floorNum} visited by elevator ${elevator.getId()}`);
+                logDebug(`floor ${floorNum} buttons - up: ${floor.up}, down: ${floor.down}`);
             };
         }
 
@@ -246,8 +299,8 @@
             return () => {
                 const floor = this.#floors[id];
                 floor[direction] = true;
-                logEvent(`floor ${id} ${direction} button pressed, ` +
-                    `up: ${floor.up}, down: ${floor.down}`);
+                logEvent(`floor ${id} ${direction} button pressed`);
+                logDebug(`floor ${id} buttons - up: ${floor.up}, down: ${floor.down}`);
                 
                 if (this.#elevatorManagerWaitingCallback != null) {
                     this.#elevatorManagerWaitingCallback(id, direction);
